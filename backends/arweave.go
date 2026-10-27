@@ -3,6 +3,7 @@ package backends
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/syndtr/goleveldb/leveldb"
@@ -20,12 +21,22 @@ type IndexEntry struct {
 	txId      []byte
 }
 
-func NewIndexEntryFromBytes(bz []byte) IndexEntry {
+// NewIndexEntryFromBytes parses one fixed-size index entry. It returns an
+// error instead of panicking when the index bytes are shorter than the
+// fixed entry size, since index data comes from the (untrusted) Arweave
+// network.
+func NewIndexEntryFromBytes(bz []byte) (IndexEntry, error) {
+	if len(bz) < IndexEntryLen {
+		return IndexEntry{}, fmt.Errorf(
+			"index entry too short: got %d bytes, need at least %d",
+			len(bz), IndexEntryLen,
+		)
+	}
 	keyPrefix := string(bz[:IndexKeyPrefixLen])
 	return IndexEntry{
 		keyPrefix: keyPrefix,
-		txId:      bz[IndexKeyPrefixLen:],
-	}
+		txId:      bz[IndexKeyPrefixLen:IndexEntryLen],
+	}, nil
 }
 
 // A read-only backend that stores data on Arweave. Each key being
@@ -54,7 +65,11 @@ func NewArweaveDB(indexDBFullPath string, arweaveNodeURL string) (*ArweaveDB, er
 	if err != nil {
 		return nil, err
 	}
-	arweaveClient := NewClient(arweaveNodeURL)
+	arweaveClient, err := NewClient(arweaveNodeURL)
+	if err != nil {
+		_ = indexDB.Close()
+		return nil, err
+	}
 	return &ArweaveDB{
 		txDataByIdGetter: func(txId []byte) ([]byte, error) {
 			return arweaveClient.DownloadChunkData(string(txId))
@@ -74,6 +89,9 @@ func NewEmptyArweaveDB() *ArweaveDB {
 
 // Get implements DB.
 func (db *ArweaveDB) Get(key []byte) ([]byte, error) {
+	if len(key) < 8 {
+		return nil, fmt.Errorf("key too short for ArweaveDB: %d bytes (need 8-byte version prefix)", len(key))
+	}
 	txIds, err := db.getArweaveTxIds(key)
 	if err != nil {
 		return nil, err
@@ -83,6 +101,9 @@ func (db *ArweaveDB) Get(key []byte) ([]byte, error) {
 
 // Has implements DB.
 func (db *ArweaveDB) Has(key []byte) (bool, error) {
+	if len(key) < 8 {
+		return false, fmt.Errorf("key too short for ArweaveDB: %d bytes (need 8-byte version prefix)", len(key))
+	}
 	txIds, err := db.getArweaveTxIds(key)
 	if err == nil {
 		_, err = db.getKeyByTxIds(key, txIds)
@@ -118,6 +139,10 @@ func (db *ArweaveDB) DeleteSync(key []byte) error {
 
 // Close implements DB.
 func (db *ArweaveDB) Close() error {
+	if db.closer == nil {
+		// Nothing to close for empty/handle-less instances (e.g. tests).
+		return nil
+	}
 	return db.closer()
 }
 
@@ -155,7 +180,13 @@ func (db *ArweaveDB) getKeyByTxIds(key []byte, txIds [][]byte) ([]byte, error) {
 			return nil, err
 		}
 		if val, ok := keyvalues[string(key)]; ok {
-			return []byte(val.(string)), nil
+			// Use the comma-ok form: remote tx data is untrusted JSON and a
+			// non-string value must not panic the host process.
+			valueStr, ok := val.(string)
+			if !ok {
+				return nil, fmt.Errorf("tx data value for key %q is not a string (got %T)", string(key), val)
+			}
+			return []byte(valueStr), nil
 		}
 	}
 	return nil, &ErrKeyNotFound{string(key)}
@@ -185,7 +216,10 @@ func (db *ArweaveDB) getArweaveTxIds(key []byte) ([][]byte, error) {
 		return nil, err
 	}
 	keyString := string(key[8:])
-	entries := getIndexEntries(keyString, index)
+	entries, err := getIndexEntries(keyString, index)
+	if err != nil {
+		return nil, err
+	}
 	res := [][]byte{}
 	for _, entry := range entries {
 		res = append(res, entry.txId)
@@ -202,10 +236,18 @@ func (db *ArweaveDB) getIndex(version []byte) ([]byte, error) {
 }
 
 // TODO: change to binary search
-func getIndexEntries(keyString string, index []byte) []IndexEntry {
+func getIndexEntries(keyString string, index []byte) ([]IndexEntry, error) {
 	res := []IndexEntry{}
 	for i := 0; i < len(index); i += IndexEntryLen {
-		indexEntry := NewIndexEntryFromBytes(index[i : i+IndexEntryLen])
+		// Fail cleanly on truncated/malicious index data instead of slicing
+		// out of bounds.
+		if i+IndexEntryLen > len(index) {
+			return nil, fmt.Errorf("index data truncated at entry %d: %d bytes left", i/IndexEntryLen, len(index)-i)
+		}
+		indexEntry, err := NewIndexEntryFromBytes(index[i : i+IndexEntryLen])
+		if err != nil {
+			return nil, err
+		}
 		if len(res) > 0 {
 			if res[0].keyPrefix == indexEntry.keyPrefix {
 				res = append(res, indexEntry)
@@ -216,14 +258,22 @@ func getIndexEntries(keyString string, index []byte) []IndexEntry {
 			res = append(res, indexEntry)
 		}
 	}
-	return res
+	return res, nil
 }
 
-func getIndexEntriesForRange(keyStart string, keyEnd string, index []byte) []IndexEntry {
+func getIndexEntriesForRange(keyStart string, keyEnd string, index []byte) ([]IndexEntry, error) {
 	res := []IndexEntry{}
 	reachedEnd := false
 	for i := 0; i < len(index); i += IndexEntryLen {
-		indexEntry := NewIndexEntryFromBytes(index[i : i+IndexEntryLen])
+		// Fail cleanly on truncated/malicious index data instead of slicing
+		// out of bounds.
+		if i+IndexEntryLen > len(index) {
+			return nil, fmt.Errorf("index data truncated at entry %d: %d bytes left", i/IndexEntryLen, len(index)-i)
+		}
+		indexEntry, err := NewIndexEntryFromBytes(index[i : i+IndexEntryLen])
+		if err != nil {
+			return nil, err
+		}
 		if reachedEnd {
 			if res[len(res)-1].keyPrefix == indexEntry.keyPrefix {
 				res = append(res, indexEntry)
@@ -237,7 +287,7 @@ func getIndexEntriesForRange(keyStart string, keyEnd string, index []byte) []Ind
 			reachedEnd = true
 		}
 	}
-	return res
+	return res, nil
 }
 
 type arweaveDBIterator struct {
@@ -254,11 +304,19 @@ type arweaveDBIterator struct {
 	txIdx             int
 
 	finished bool
+	// lastErr records the most recent failure (e.g. a network error while
+	// loading the next transaction) so iterators report it via Error()
+	// instead of panicking inside Next().
+	lastErr error
 }
 
 var _ dbm.Iterator = (*arweaveDBIterator)(nil)
 
 func newArweaveDBIterator(start []byte, end []byte, db *ArweaveDB, reverse bool) (*arweaveDBIterator, error) {
+	// Guard against short keys before the version-equality slices below.
+	if len(start) < 8 || len(end) < 8 {
+		return nil, errors.New("start and end keys must include an 8-byte version prefix")
+	}
 	if string(start[:8]) != string(end[:8]) {
 		return nil, errors.New("Start and end must be of the same version")
 	}
@@ -268,7 +326,10 @@ func newArweaveDBIterator(start []byte, end []byte, db *ArweaveDB, reverse bool)
 		return nil, err
 	}
 	start, end = start[8:], end[8:]
-	entries := getIndexEntriesForRange(string(start), string(end), index)
+	entries, err := getIndexEntriesForRange(string(start), string(end), index)
+	if err != nil {
+		return nil, err
+	}
 	txIds := [][]byte{}
 	for _, entry := range entries {
 		txIds = append(txIds, entry.txId)
@@ -297,6 +358,10 @@ func newArweaveDBIterator(start []byte, end []byte, db *ArweaveDB, reverse bool)
 			iter.Next()
 		}
 	}
+	if iter.lastErr != nil {
+		// Surface errors encountered while skipping out-of-range entries.
+		return nil, iter.lastErr
+	}
 	return iter, nil
 }
 
@@ -310,7 +375,12 @@ func (itr *arweaveDBIterator) loadTx() error {
 	}
 	data, err := itr.db.getTxDataAsMap(itr.txIds[itr.txIdx])
 	if err != nil {
-		return err
+		// Record the failure instead of propagating it into a panic from
+		// callers such as Next(); the iterator becomes invalid and reports
+		// the cause via Error().
+		itr.lastErr = err
+		itr.finished = true
+		return nil
 	}
 	if len(data) == 0 {
 		if itr.reverse {
@@ -349,6 +419,9 @@ func (itr *arweaveDBIterator) Domain() ([]byte, []byte) {
 
 // Valid implements Iterator.
 func (itr *arweaveDBIterator) Valid() bool {
+	if itr.lastErr != nil {
+		return false
+	}
 	return !itr.finished
 }
 
@@ -365,7 +438,14 @@ func (itr *arweaveDBIterator) Value() []byte {
 	if itr.finished {
 		return nil
 	}
-	return []byte(itr.currentTxData[itr.currentSortedKeys[itr.currentKeyIdx]].(string))
+	// Comma-ok form: remote tx data is untrusted JSON; a non-string value
+	// must not crash the host process.
+	raw := itr.currentTxData[itr.currentSortedKeys[itr.currentKeyIdx]]
+	valueStr, ok := raw.(string)
+	if !ok {
+		return nil
+	}
+	return []byte(valueStr)
 }
 
 // Next implements Iterator.
@@ -381,8 +461,11 @@ func (itr *arweaveDBIterator) Next() {
 			}
 		} else {
 			itr.txIdx--
+			// On failure loadTx records lastErr and marks the iterator
+			// invalid; do not panic the host process on transient errors.
 			if err := itr.loadTx(); err != nil {
-				panic(err)
+				itr.lastErr = err
+				itr.finished = true
 			}
 		}
 	} else {
@@ -393,8 +476,11 @@ func (itr *arweaveDBIterator) Next() {
 			}
 		} else {
 			itr.txIdx++
+			// On failure loadTx records lastErr and marks the iterator
+			// invalid; do not panic the host process on transient errors.
 			if err := itr.loadTx(); err != nil {
-				panic(err)
+				itr.lastErr = err
+				itr.finished = true
 			}
 		}
 	}
@@ -402,7 +488,7 @@ func (itr *arweaveDBIterator) Next() {
 
 // Error implements Iterator.
 func (itr *arweaveDBIterator) Error() error {
-	return nil
+	return itr.lastErr
 }
 
 // Close implements Iterator.

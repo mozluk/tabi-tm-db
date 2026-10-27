@@ -78,28 +78,33 @@ func intToBase64Sha256(i int) string {
 
 func TestGetIndexEntries(t *testing.T) {
 	index := mockIndex([]string{"ab", "cd"}, []int{0, 1})
-	entries := getIndexEntries("cc", index)
+	entries, err := getIndexEntries("cc", index)
+	require.NoError(t, err)
 	require.Equal(t, 1, len(entries))
 	require.Equal(t, string(padZeroes("cd")), entries[0].keyPrefix)
 	require.Equal(t, intToBase64Sha256(1), string(entries[0].txId))
 
-	entries = getIndexEntries("aab", index)
+	entries, err = getIndexEntries("aab", index)
+	require.NoError(t, err)
 	require.Equal(t, 1, len(entries))
 	require.Equal(t, string(padZeroes("ab")), entries[0].keyPrefix)
 	require.Equal(t, intToBase64Sha256(0), string(entries[0].txId))
 
-	entries = getIndexEntries("abc", index)
+	entries, err = getIndexEntries("abc", index)
+	require.NoError(t, err)
 	require.Equal(t, 1, len(entries))
 	require.Equal(t, string(padZeroes("cd")), entries[0].keyPrefix)
 	require.Equal(t, intToBase64Sha256(1), string(entries[0].txId))
 
 	// doesn't exist
-	entries = getIndexEntries("cde", index)
+	entries, err = getIndexEntries("cde", index)
+	require.NoError(t, err)
 	require.Equal(t, 0, len(entries))
 
 	// multiple TXs for the same prefix
 	index = mockIndex([]string{"ab", "cd", "cd", "ce"}, []int{0, 1, 2, 3})
-	entries = getIndexEntries("cc", index)
+	entries, err = getIndexEntries("cc", index)
+	require.NoError(t, err)
 	require.Equal(t, 2, len(entries))
 	require.Equal(t, string(padZeroes("cd")), entries[0].keyPrefix)
 	require.Equal(t, intToBase64Sha256(1), string(entries[0].txId))
@@ -110,27 +115,35 @@ func TestGetIndexEntries(t *testing.T) {
 func TestGetIndexEntriesForRange(t *testing.T) {
 	// empty
 	index := mockIndex([]string{}, []int{})
-	entries := getIndexEntriesForRange("a", "b", index)
+	entries, err := getIndexEntriesForRange("a", "b", index)
+	require.NoError(t, err)
 	require.Equal(t, 0, len(entries))
 
 	// single TX
 	index = mockIndex([]string{"ab"}, []int{0})
-	entries = getIndexEntriesForRange("aa", "ac", index)
+	entries, err = getIndexEntriesForRange("aa", "ac", index)
+	require.NoError(t, err)
 	require.Equal(t, 1, len(entries))
-	entries = getIndexEntriesForRange("ab", "ac", index)
+	entries, err = getIndexEntriesForRange("ab", "ac", index)
+	require.NoError(t, err)
 	require.Equal(t, 1, len(entries))
-	entries = getIndexEntriesForRange("ac", "ad", index)
+	entries, err = getIndexEntriesForRange("ac", "ad", index)
+	require.NoError(t, err)
 	require.Equal(t, 0, len(entries))
 
 	// multiple TX
 	index = mockIndex([]string{"ab", "cd", "cd", "ce"}, []int{0, 1, 2, 3})
-	entries = getIndexEntriesForRange("ab", "cd", index)
+	entries, err = getIndexEntriesForRange("ab", "cd", index)
+	require.NoError(t, err)
 	require.Equal(t, 3, len(entries))
-	entries = getIndexEntriesForRange("ab", "ce", index)
+	entries, err = getIndexEntriesForRange("ab", "ce", index)
+	require.NoError(t, err)
 	require.Equal(t, 4, len(entries))
-	entries = getIndexEntriesForRange("cd", "cf", index)
+	entries, err = getIndexEntriesForRange("cd", "cf", index)
+	require.NoError(t, err)
 	require.Equal(t, 3, len(entries))
-	entries = getIndexEntriesForRange("aa", "cf", index)
+	entries, err = getIndexEntriesForRange("aa", "cf", index)
+	require.NoError(t, err)
 	require.Equal(t, 4, len(entries))
 }
 
@@ -261,4 +274,53 @@ func TestIterator(t *testing.T) {
 	tester("aa", "cd", []string{"aa", "cc"}, []string{"v1", "v2"})
 	tester("aa", "ce", []string{"aa", "cc", "cd"}, []string{"v1", "v2", "v3"})
 	tester("aa", "cea", []string{"aa", "cc", "cd", "ce"}, []string{"v1", "v2", "v3", "v4"})
+}
+
+func TestShortIndexEntryDoesNotPanic(t *testing.T) {
+	// Index data smaller than one fixed entry must return an error, not panic.
+	_, err := getIndexEntries("cc", []byte("ab"))
+	require.Error(t, err)
+
+	shortEntry := make([]byte, IndexEntryLen-1)
+	_, err = NewIndexEntryFromBytes(shortEntry)
+	require.Error(t, err)
+
+	_, err = getIndexEntriesForRange("a", "b", []byte("ab"))
+	require.Error(t, err)
+}
+
+func TestNonStringValueDoesNotPanic(t *testing.T) {
+	// Remote tx data with a non-string value must return an error, not panic.
+	txId := intToBase64Sha256(0)
+	nonStringData, err := json.Marshal(map[string]interface{}{"aa": 42})
+	require.NoError(t, err)
+	db := &ArweaveDB{
+		txDataByIdGetter:  func([]byte) ([]byte, error) { return nonStringData, nil },
+		versionTxIdGetter: func([]byte) ([]byte, error) { return []byte(txId), nil },
+		closer:            func() error { return nil },
+	}
+
+	v0Bz := make([]byte, 8)
+	value, err := db.Get(append(v0Bz, []byte("aa")...))
+	require.Error(t, err)
+	require.Nil(t, value)
+}
+
+func TestShortKeyDoesNotPanic(t *testing.T) {
+	db := NewEmptyArweaveDB()
+	value, err := db.Get([]byte("ab"))
+	require.Error(t, err)
+	require.Nil(t, value)
+
+	exists, err := db.Has([]byte("ab"))
+	require.Error(t, err)
+	require.False(t, exists)
+
+	_, err = db.Iterator([]byte("ab"), []byte("cde"))
+	require.Error(t, err)
+}
+
+func TestCloseNilCloserIsSafe(t *testing.T) {
+	db := NewEmptyArweaveDB()
+	require.NoError(t, db.Close())
 }
